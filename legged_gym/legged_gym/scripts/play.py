@@ -37,6 +37,7 @@ from legged_gym.utils import  get_args, export_policy_as_jit, task_registry, Log
 
 import numpy as np
 import torch
+import torch.nn as nn # 新增：用于构建 Wrapper
 
 
 def play(args, x_vel=1.0, y_vel=0.0, yaw_vel=0.0):
@@ -67,11 +68,53 @@ def play(args, x_vel=1.0, y_vel=0.0, yaw_vel=0.0):
     policy = ppo_runner.get_inference_policy(device=env.device)
 
 
-    # export policy as a jit module (used to run it from C++)
+    # =========================================================================
+    # 🌟 替换部分：全自动导出 ONNX 模型 (支持带 Encoder 的 RMA/HIM 架构)
+    # =========================================================================
     if EXPORT_POLICY:
-        path = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name, 'exported', 'policies')
-        export_policy_as_jit(ppo_runner.alg.actor_critic, path)
-        print('Exported policy as jit script to: ', path)
+        print("\n[*] 正在准备导出 ONNX 模型...")
+        
+        # 1. 包装完整的推理网络 (包含 Encoder 编码器和 Actor)
+        class ActorDeploymentWrapper(nn.Module):
+            def __init__(self, actor_critic_model):
+                super().__init__()
+                self.model = actor_critic_model
+                
+            def forward(self, obs):
+                # 极其关键：调用 act_inference，它会自动处理 270 -> Encoder -> 拼接 -> 64 -> Actor 的逻辑
+                return self.model.act_inference(obs)
+                
+        # 实例化包装器并设置为评估模式
+        deployment_policy = ActorDeploymentWrapper(ppo_runner.alg.actor_critic)
+        deployment_policy.eval() 
+        deployment_policy.to('cpu')
+        
+        # 2. 虚拟输入 (维持 270 维不变)
+        dummy_input = torch.randn(1, env.num_obs, dtype=torch.float32, device='cpu')
+        
+        # 3. 自动生成并创建存放目录
+        export_dir = os.path.join(LEGGED_GYM_ROOT_DIR, 'logs', train_cfg.runner.experiment_name, 'exported', 'policies')
+        os.makedirs(export_dir, exist_ok=True) 
+        onnx_path = os.path.join(export_dir, 'policy.onnx')
+        
+        # 4. 执行导出！
+        torch.onnx.export(
+            deployment_policy,             
+            dummy_input,                   
+            onnx_path,                     
+            export_params=True,            
+            opset_version=14,              
+            input_names=['obs'],           
+            output_names=['actions']       
+        )
+        print(f"[+] 恭喜！ONNX 模型已成功导出至: {onnx_path}\n")
+
+        # =======================================================
+        # 🟢 新增这一行：导出完毕后，把模型重新送回显卡，保证下方仿真正常运行！
+        deployment_policy.to(env.device)
+        # =======================================================
+    # =========================================================================
+
 
     logger = Logger(env.dt)
     robot_index = 0 # which robot is used for logging

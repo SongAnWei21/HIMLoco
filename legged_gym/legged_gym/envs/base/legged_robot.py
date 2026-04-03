@@ -134,6 +134,11 @@ class LeggedRobot(BaseTask):
 
         self._post_physics_step_callback()
 
+        #self.roll, self.pitch, self.yaw = euler_from_quaternion(self.base_quat)
+        contact = self.contact_forces[:, self.feet_indices, 2] > 1.
+        self.contact_filt = torch.logical_or(contact, self.last_contacts) 
+        self.last_contacts = contact
+
         # compute observations, rewards, resets, ...
         self.check_termination()
         self.compute_reward()
@@ -142,6 +147,9 @@ class LeggedRobot(BaseTask):
         self.reset_idx(env_ids)
         self.compute_observations() # in some cases a simulation step might be required to refresh some obs (for example body positions)
 
+        contact = self.contact_forces[:, self.feet_indices, 2] > 1.
+        self.contact_filt = torch.logical_or(contact, self.last_contacts) 
+        self.last_contacts = contact
 
         self.disturbance[:, :, :] = 0.0
         self.last_last_actions[:] = self.last_actions[:]
@@ -242,8 +250,9 @@ class LeggedRobot(BaseTask):
             self.episode_sums["termination"] += rew
     
     def compute_observations(self):
-        """ Computes observations
-        """
+        # ==========================================
+        # 1. 完全复刻原版：组装当前观测值并分段加噪
+        # ==========================================
         current_obs = torch.cat((   self.commands[:, :3] * self.commands_scale,
                                     self.base_ang_vel  * self.obs_scales.ang_vel,
                                     self.projected_gravity,
@@ -251,19 +260,53 @@ class LeggedRobot(BaseTask):
                                     self.dof_vel * self.obs_scales.dof_vel,
                                     self.actions
                                     ),dim=-1)
-        # add noise if needed
+        
+        # 基础部分加噪
         if self.add_noise:
             current_obs += (2 * torch.rand_like(current_obs) - 1) * self.noise_scale_vec[0:(9 + 3 * self.num_actions)]
 
-        # add perceptive inputs if not blind
+        # 拼接无噪部分 (线速度、扰动)
         current_obs = torch.cat((current_obs, self.base_lin_vel * self.obs_scales.lin_vel, self.disturbance[:, 0, :]), dim=-1)
+        
+        # 拼接高度图并加噪
         if self.cfg.terrain.measure_heights:
             heights = torch.clip(self.root_states[:, 2].unsqueeze(1) - 0.5 - self.measured_heights, -1, 1.) * self.obs_scales.height_measurements 
-            heights += (2 * torch.rand_like(heights) - 1) * self.noise_scale_vec[(9 + 3 * self.num_actions):(9 + 3 * self.num_actions+187)]
+            if self.add_noise:
+                heights += (2 * torch.rand_like(heights) - 1) * self.noise_scale_vec[(9 + 3 * self.num_actions):(9 + 3 * self.num_actions+187)]
             current_obs = torch.cat((current_obs, heights), dim=-1)
 
-        self.obs_buf = torch.cat((current_obs[:, :self.num_one_step_obs], self.obs_buf[:, :-self.num_one_step_obs]), dim=-1)
-        self.privileged_obs_buf = torch.cat((current_obs[:, :self.num_one_step_privileged_obs], self.privileged_obs_buf[:, :-self.num_one_step_privileged_obs]), dim=-1)
+        # ==========================================
+        # 2. 截取单步观测并送入延迟环形 Buffer
+        # ==========================================
+        # 此时 current_obs 包含了所有东西且该加噪的都加了，我们安全地切片
+        one_step_obs = current_obs[:, :self.num_one_step_obs].clone()
+
+        # 写入 Buffer
+        current_ptr = self.episode_length_buf % self.delay_buf_len
+        self.delay_history_buf[self.env_indices, current_ptr, :] = one_step_obs
+        
+        # 如果环境刚重置，用当前状态填满整个延迟历史，并重新随机分配延迟步数
+        reset_env_ids = (self.episode_length_buf == 0).nonzero(as_tuple=False).flatten()
+        if len(reset_env_ids) > 0:
+            self.delay_history_buf[reset_env_ids] = one_step_obs[reset_env_ids].unsqueeze(1).expand(-1, self.delay_buf_len, -1)
+            self.env_delay_steps[reset_env_ids] = torch.randint(0, self.max_delay_steps + 1, (len(reset_env_ids),), device=self.device)
+
+        # 提取延迟后的观测值
+        delayed_ptr = (current_ptr - self.env_delay_steps) % self.delay_buf_len
+        delayed_one_step_obs = self.delay_history_buf[self.env_indices, delayed_ptr, :]
+
+        # ==========================================
+        # 3. 更新系统的观测窗口 (Sliding Window)
+        # ==========================================
+        # 给 Actor (策略网络) 喂带有延迟的观测
+        self.obs_buf = torch.cat((delayed_one_step_obs, self.obs_buf[:, :-self.num_one_step_obs]), dim=-1)
+        
+        # 给 Critic (特权网络) 喂无延迟的、包含所有特权信息的当前观测
+        if self.privileged_obs_buf is not None:
+            self.privileged_obs_buf = torch.cat((current_obs[:, :self.num_one_step_privileged_obs], self.privileged_obs_buf[:, :-self.num_one_step_privileged_obs]), dim=-1)
+
+
+
 
     def get_current_obs(self):
         current_obs = torch.cat((   self.commands[:, :3] * self.commands_scale,
@@ -668,6 +711,25 @@ class LeggedRobot(BaseTask):
         self.base_lin_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 7:10])
         self.base_ang_vel = quat_rotate_inverse(self.base_quat, self.root_states[:, 10:13])
         self.projected_gravity = quat_rotate_inverse(self.base_quat, self.gravity_vec)
+
+        # =========================================================
+        # 🟢 新增：观测延迟 (Observation Delay) 的环形缓冲区初始化
+        # =========================================================
+        self.max_delay_steps = 3 # 最大延迟 3 个 timestep
+        self.delay_buf_len = self.max_delay_steps + 1
+        
+        # 缓冲区形状：[环境数量, 延迟步数, 单步观测值维度]
+        self.delay_history_buf = torch.zeros(
+            (self.num_envs, self.delay_buf_len, self.num_one_step_obs), 
+            dtype=torch.float, device=self.device, requires_grad=False
+        )
+        # 为每个环境随机分配一个初始延迟步数
+        self.env_delay_steps = torch.randint(
+            0, self.max_delay_steps + 1, (self.num_envs,), device=self.device
+        )
+        self.env_indices = torch.arange(self.num_envs, device=self.device)
+        # =========================================================
+
         if self.cfg.terrain.measure_heights:
             self.height_points = self._init_height_points()
         self.measured_heights = self._get_heights()
@@ -1220,3 +1282,37 @@ class LeggedRobot(BaseTask):
     def _reward_feet_contact_forces(self):
         # penalize high contact forces
         return torch.sum((torch.norm(self.contact_forces[:, self.feet_indices, :], dim=-1) -  self.cfg.rewards.max_contact_force).clip(min=0.), dim=1)
+
+    def _reward_foot_slide_up(self):
+        cur_footvel_translated = self.feet_vel - self.root_states[:, 7:10].unsqueeze(1)
+        footvel_in_body_frame = torch.zeros(self.num_envs, len(self.feet_indices), 3, device=self.device)
+        for i in range(len(self.feet_indices)):
+            footvel_in_body_frame[:, i, :] = quat_rotate_inverse(self.base_quat, cur_footvel_translated[:, i, :])
+        foot_leteral_vel = torch.sqrt(torch.sum(torch.square(footvel_in_body_frame[:, :, :2]), dim=2)).view(self.num_envs, -1)
+        
+        cost_slide = torch.sum(self.contact_filt * foot_leteral_vel, dim=1)*torch.clamp(-self.projected_gravity[:,2],0,1)
+        return cost_slide
+
+    def _reward_foot_mirror_up(self):
+        diff1 = torch.sum(torch.square(self.dof_pos[:,[0,1,2]] - self.dof_pos[:,[9,10,11]]),dim=-1)
+        diff2 = torch.sum(torch.square(self.dof_pos[:,[3,4,5]] - self.dof_pos[:,[6,7,8]]),dim=-1)
+        return 0.5*torch.clamp(-self.projected_gravity[:,2],0,1)*(diff1 + diff2)
+    
+    def _reward_foot_clearance_up(self):
+        cur_footpos_translated = self.feet_pos - self.root_states[:, 0:3].unsqueeze(1)
+        footpos_in_body_frame = torch.zeros(self.num_envs, len(self.feet_indices), 3, device=self.device)
+        cur_footvel_translated = self.feet_vel - self.root_states[:, 7:10].unsqueeze(1)
+        footvel_in_body_frame = torch.zeros(self.num_envs, len(self.feet_indices), 3, device=self.device)
+        for i in range(len(self.feet_indices)):
+            footpos_in_body_frame[:, i, :] = quat_rotate_inverse(self.base_quat, cur_footpos_translated[:, i, :])
+            footvel_in_body_frame[:, i, :] = quat_rotate_inverse(self.base_quat, cur_footvel_translated[:, i, :])
+        
+        height_error = torch.square(footpos_in_body_frame[:, :, 2] - self.cfg.rewards.clearance_height_target).view(self.num_envs, -1)
+        foot_leteral_vel = torch.sqrt(torch.sum(torch.square(footvel_in_body_frame[:, :, :2]), dim=2)).view(self.num_envs, -1)
+        #no_contact = 1.*(self.contact_filt == 0)
+
+        clearance_reward = height_error * foot_leteral_vel 
+        
+        return torch.sum(clearance_reward, dim=1)*torch.clamp(-self.projected_gravity[:,2],0,1)
+
+        
